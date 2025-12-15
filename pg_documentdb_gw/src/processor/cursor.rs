@@ -113,17 +113,35 @@ pub async fn process_get_more(
     let request = request_context.payload;
 
     let mut id = None;
+    let mut batch_size = 101; // default change stream cursors batch size
+    let mut max_time_ms = None;
     request.extract_fields(|k, v| {
         if k == "getMore" {
             id = Some(v.as_i64().ok_or(DocumentDBError::bad_value(
                 "getMore value should be an i64".to_string(),
             ))?)
+        } else if k == "batchSize" {
+            batch_size = v.as_i32().unwrap_or(100) as usize;
+        } else if k == "maxTimeMS" {
+            max_time_ms = v.as_i64();
         }
         Ok(())
     })?;
     let id = id.ok_or(DocumentDBError::bad_value(
         "getMore not present in document".to_string(),
     ))?;
+
+    // Check if this is a changestream cursor
+    let manager = connection_context.service_context.changestream_manager();
+    if manager.has_cursor(id).await {
+        return crate::changestream::process_changestream_getmore(
+            id,
+            connection_context,
+            batch_size,
+            max_time_ms,
+        )
+        .await;
+    }
     let CursorStoreEntry {
         conn: cursor_connection,
         cursor,

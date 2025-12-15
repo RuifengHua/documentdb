@@ -158,6 +158,8 @@ function SetupPostgresConfigurations()
   echo documentdb.enableBackgroundWorker = 'true' | tee -a $installdir/postgresql.conf
   echo documentdb.enableBackgroundWorkerJobs = 'true' | tee -a $installdir/postgresql.conf
   echo ssl = off | tee -a $installdir/postgresql.conf
+  echo wal_level = logical | tee -a $installdir/postgresql.conf
+  echo max_replication_slots = 10 | tee -a $installdir/postgresql.conf
 }
 
 

@@ -240,6 +240,14 @@ CreatePostgresDataTable(uint64_t collectionId, const char *colocateWith, const
 	ExtensionExecuteQueryViaSPI(createTableStringInfo->data, readOnly, SPI_OK_UTILITY,
 								&isNull);
 
+	/* Set REPLICA IDENTITY FULL for change stream support */
+	resetStringInfo(createTableStringInfo);
+	appendStringInfo(createTableStringInfo,
+					 "ALTER TABLE %s REPLICA IDENTITY FULL",
+					 dataTableNameInfo->data);
+	ExtensionExecuteQueryViaSPI(createTableStringInfo->data, readOnly, SPI_OK_UTILITY,
+								&isNull);
+
 	/* Change the owner to the extension admin */
 	resetStringInfo(createTableStringInfo);
 	appendStringInfo(createTableStringInfo,

@@ -9,6 +9,7 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::{
+    changestream::ChangeStreamManager,
     configuration::{DynamicConfiguration, SetupConfiguration},
     context::{CursorStore, TransactionStore},
     postgres::{PoolManager, QueryCatalog},
@@ -23,6 +24,7 @@ pub struct ServiceContextInner {
     pub transaction_store: TransactionStore,
     pub query_catalog: QueryCatalog,
     pub tls_provider: TlsProvider,
+    pub changestream_manager: Arc<ChangeStreamManager>,
 }
 
 #[derive(Clone)]
@@ -47,6 +49,7 @@ impl ServiceContext {
             transaction_store: TransactionStore::new(Duration::from_secs(timeout_secs)),
             query_catalog,
             tls_provider,
+            changestream_manager: Arc::new(ChangeStreamManager::new()),
         };
         ServiceContext(Arc::new(inner))
     }
@@ -77,5 +80,9 @@ impl ServiceContext {
 
     pub fn connection_pool_manager(&self) -> &PoolManager {
         &self.0.connection_pool_manager
+    }
+
+    pub fn changestream_manager(&self) -> &Arc<ChangeStreamManager> {
+        &self.0.changestream_manager
     }
 }

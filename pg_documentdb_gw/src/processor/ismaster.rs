@@ -6,10 +6,7 @@
  *-------------------------------------------------------------------------
  */
 
-use std::{
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::sync::Arc;
 
 use bson::rawdoc;
 
@@ -28,15 +25,7 @@ pub async fn process(
     dynamic_configuration: &Arc<dyn DynamicConfiguration>,
 ) -> Result<Response> {
     let request = request_context.payload;
-    let local_time = i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| {
-                DocumentDBError::internal_error("Failed to get the current time".to_string())
-            })?
-            .as_millis(),
-    )
-    .map_err(|_| DocumentDBError::internal_error("Current time exceeded an i64".to_string()))?;
+    let local_time = crate::util::get_current_time_millis()?;
 
     if let Ok(client) = request.document().get_document("client") {
         if connection_context.client_information.is_some() {

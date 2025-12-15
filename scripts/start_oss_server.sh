@@ -253,6 +253,10 @@ if [ "$initSetup" == "true" ]; then
   if [ "$customAdminUser" != "" ]; then
     SetupCustomAdminUser "$customAdminUser" "$customAdminUserPassword" $coordinatorPort "$userName"
   fi
+  
+  # Create replication slot for changestream support
+  echo "${green}Creating replication slot for changestream support${reset}"
+  psql -p $coordinatorPort -d postgres -c "SELECT pg_create_logical_replication_slot('documentdb_changestream', 'documentdb_decoder');" || echo "${red}Warning: Failed to create replication slot. Ensure documentdb_decoder.so is installed.${reset}"
 fi
 
 if [ "$valgrindMode" == "true" ]; then

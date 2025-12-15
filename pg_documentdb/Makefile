@@ -35,7 +35,7 @@ ALLOW_DEFAULT_VISIBILITY=yes
 
 USE_DOCUMENTDB_CORE = 1
 include $(OSS_SRC_DIR)/Makefile.cflags
-SOURCES = $(wildcard src/*.c) $(wildcard src/**/*.c)
+SOURCES = $(filter-out src/replication/documentdb_decoder.c,$(wildcard src/*.c) $(wildcard src/**/*.c))
 
 OBJS = $(patsubst %.c,%.o,$(SOURCES))
 
@@ -95,10 +95,16 @@ check-regress:
 	$(MAKE) -C src/test check-regress
 
 # Before installing, trim any files extension*.sql files in the target install directory
-install: trim_installed_data_files
+install: trim_installed_data_files install-decoder
 
 trim_installed_data_files:
 	rm -f $(DESTDIR)$(datadir)/$(datamoduledir)/$(EXTENSION)--*.sql
+
+install-decoder:
+	@echo "Building and installing documentdb_decoder..."
+	$(MAKE) -C src/replication clean
+	$(MAKE) -C src/replication
+	$(MAKE) -C src/replication install
 
 build-sql: $(generated_sql_files)
 

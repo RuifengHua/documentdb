@@ -72,6 +72,19 @@ pub async fn process_aggregate(
     connection_context: &ConnectionContext,
     pg_data_client: &impl PgDataClient,
 ) -> Result<Response> {
+    // Check if this is a changestream watch request and route accordingly
+    if is_changestream_request(request_context)? {
+        let db = request_context.info.db()?;
+        let collection = request_context.info.collection().unwrap_or("");
+        return crate::changestream::process_changestream(
+            request_context,
+            connection_context,
+            db,
+            collection,
+        )
+        .await;
+    }
+
     let (response, conn) = pg_data_client
         .execute_aggregate(request_context, connection_context)
         .await?;
@@ -157,6 +170,38 @@ pub async fn process_count(
     pg_data_client
         .execute_count_query(request_context, connection_context)
         .await
+}
+
+/// Checks if an aggregate request is a change stream watch request.
+///
+/// Returns true if the pipeline's first stage is $changeStream, false otherwise.
+fn is_changestream_request(request_context: &RequestContext<'_>) -> Result<bool> {
+    // check if the request has the key "pipeline" and the value is of an array
+    let pipeline = match request_context.payload.document().get("pipeline")? {
+        Some(p) => match p.as_array() {
+            Some(arr) => arr,
+            None => return Ok(false),
+        },
+        None => return Ok(false),
+    };
+
+    // check if the array is not empty and get the first element
+    let first_stage = match pipeline.into_iter().next() {
+        Some(stage) => stage?,
+        None => return Ok(false),
+    };
+
+    // get the key of the first element
+    let stage_key = match first_stage
+        .as_document()
+        .and_then(|doc| doc.into_iter().next())
+    {
+        Some(Ok((key, _))) => key,
+        _ => return Ok(false),
+    };
+
+    // return true if the key is "$changeStream"
+    Ok(stage_key == "$changeStream")
 }
 
 fn convert_to_scale(scale: RawBsonRef) -> Result<f64> {

@@ -8,6 +8,7 @@
 
 pub mod auth;
 pub mod bson;
+pub mod changestream;
 pub mod configuration;
 pub mod context;
 pub mod error;
@@ -21,6 +22,7 @@ pub mod service;
 pub mod shutdown_controller;
 pub mod startup;
 pub mod telemetry;
+pub mod util;
 
 pub use crate::postgres::QueryCatalog;
 
