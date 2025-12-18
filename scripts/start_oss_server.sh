@@ -222,6 +222,11 @@ if [ "$useDocumentdbExtendedRum" == "true" ] && [ "$initSetup" == "true" ]; then
   echo "documentdb.alternate_index_handler_name = 'extended_rum'" >> $postgresConfigFile
 fi
 
+# Enable track_commit_timestamp
+if [ "$initSetup" == "true" ]; then
+  echo "track_commit_timestamp = on" >> $postgresConfigFile
+fi
+
 if [ "$extraConfigFile" != "" ]; then
   echo "include '$extraConfigFile'" >> $postgresConfigFile
 fi
@@ -236,10 +241,21 @@ if [ "$logPath" == "" ]; then
   logPath="$postgresDirectory/pglog.log"
 fi
 
+# Build and install extension to ensure latest functions are available
+echo "${green}Building and installing pg_documentdb extension${reset}"
+sudo make -C $scriptDir/../pg_documentdb install
+
 StartServer $postgresDirectory $coordinatorPort $logPath
 
 if [ "$initSetup" == "true" ]; then
   SetupPostgresServerExtensions "$userName" $coordinatorPort $extensionName
+fi
+
+# Upgrade extension to latest version to include all new functions
+echo "${green}Upgrading pg_documentdb extension to latest version${reset}"
+psql -p $coordinatorPort -d postgres -c "ALTER EXTENSION documentdb UPDATE;" || echo "${red}Warning: Extension already at latest version${reset}"
+
+if [ "$initSetup" == "true" ]; then
 
   if [ "$useDocumentdbExtendedRum" == "true" ] && [ "$initSetup" == "true" ]; then
     psql -p $coordinatorPort -d postgres -c "CREATE EXTENSION documentdb_extended_rum"
