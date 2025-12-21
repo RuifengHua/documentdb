@@ -1,5 +1,5 @@
 use crate::{
-    changestream::{ChangeEvent, ChangeStreamManager},
+    changestream::ChangeEvent,
     context::{ConnectionContext, RequestContext},
     error::{DocumentDBError, ErrorCode, Result},
     postgres::Connection,
@@ -9,27 +9,20 @@ use crate::{
 };
 use bson::{rawdoc, RawArrayBuf};
 
-pub async fn process_changestream(
-    _request_context: &RequestContext<'_>,
-    connection_context: &ConnectionContext,
+fn build_cursor_response(
+    cursor_id: i64,
     db: &str,
-    collection: &str,
+    ns_suffix: &str,
+    batch: RawArrayBuf,
+    resume_token: &str,
 ) -> Result<Response> {
-    let manager = connection_context.service_context.changestream_manager();
-    let namespace = format!("{}.{}", db, collection);
-    let cursor_id = manager.create_cursor(namespace).await;
-
-    let ns = format!("{}.{}", db, collection);
-    // return an empty first batch for initial watch() call
-    let first_batch = RawArrayBuf::new();
-
     let local_time = get_current_time_millis()?;
-
     Ok(Response::Raw(RawResponse(rawdoc! {
         "cursor": {
             "id": cursor_id,
-            "ns": ns,
-            "firstBatch": first_batch
+            "ns": format!("{}.{}", db, ns_suffix),
+            "firstBatch": batch,
+            "postBatchResumeToken": { "_data": encode_resume_token(resume_token) }
         },
         "operationTime": bson::Timestamp {
             time: (local_time / 1000) as u32,
@@ -39,12 +32,91 @@ pub async fn process_changestream(
     })))
 }
 
-/// Process getMore request for change stream cursor.
-///
-/// Polls WAL for new changes, retrieves events for the cursor, converts them to MongoDB
-/// change event format, and returns them in nextBatch. Implements server-side blocking:
-/// loops until events are found or timeout occurs. Uses maxTimeMS to distinguish between
-/// next() (blocking) and try_next() (immediate return with maxTimeMS=0).
+fn build_getmore_response(
+    cursor_id: i64,
+    batch: RawArrayBuf,
+    resume_token: &str,
+) -> Result<Response> {
+    let local_time = get_current_time_millis()?;
+    Ok(Response::Raw(RawResponse(rawdoc! {
+        "cursor": {
+            "id": cursor_id,
+            "nextBatch": batch,
+            "postBatchResumeToken": { "_data": encode_resume_token(resume_token) }
+        },
+        "ok": 1.0,
+        "operationTime": bson::Timestamp {
+            time: (local_time / 1000) as u32,
+            increment: (local_time % 1000) as u32
+        }
+    })))
+}
+
+pub async fn process_changestream(
+    _request_context: &RequestContext<'_>,
+    connection_context: &ConnectionContext,
+    db: &str,
+    collection: &str,
+    resume_token: Option<String>,
+    start_at_operation_time: Option<i64>,
+) -> Result<Response> {
+    let manager = connection_context.service_context.changestream_manager();
+    let is_db_level = collection.is_empty();
+    let namespace = if is_db_level {
+        db.to_string()
+    } else {
+        format!("{}.{}", db, collection)
+    };
+
+    let start_lsn = match resume_token {
+        // If user provided resumeAfter, we should use that lsn to start
+        Some(token) => Some(decode_resume_token(&token)?),
+        // If resume_token is None and start_at_operation_time is None, then we use the current LSN
+        None if start_at_operation_time.is_none() => {
+            Some(get_current_lsn(connection_context).await?)
+        }
+        // If start_at_operation_time is provided, we set resume_token to None and use start_at_operation_time later
+        None => None,
+    };
+
+    let cursor_id = manager
+        .create_cursor(namespace, start_lsn.clone(), start_at_operation_time)
+        .await;
+    let ns_suffix = if is_db_level {
+        "$cmd.aggregate"
+    } else {
+        collection
+    };
+    let resume_token = start_lsn.as_deref().unwrap_or("");
+
+    build_cursor_response(cursor_id, db, ns_suffix, RawArrayBuf::new(), resume_token)
+}
+
+async fn get_current_lsn(connection_context: &ConnectionContext) -> Result<String> {
+    let pool = connection_context
+        .service_context
+        .connection_pool_manager()
+        .system_requests_connection()
+        .await?;
+    let rows = pool
+        .query(
+            "SELECT pg_current_wal_lsn()::text",
+            &[],
+            &[],
+            None,
+            &mut RequestTracker::new(),
+        )
+        .await?;
+    rows.first()
+        .and_then(|row| row.try_get::<_, String>(0).ok())
+        .ok_or_else(|| {
+            DocumentDBError::documentdb_error(
+                ErrorCode::InternalError,
+                "Failed to get current LSN".to_string(),
+            )
+        })
+}
+
 pub async fn process_changestream_getmore(
     cursor_id: i64,
     connection_context: &ConnectionContext,
@@ -52,167 +124,176 @@ pub async fn process_changestream_getmore(
     max_time_ms: Option<i64>,
 ) -> Result<Response> {
     let manager = connection_context.service_context.changestream_manager();
-
-    if !manager.has_cursor(cursor_id).await {
-        return Err(DocumentDBError::documentdb_error(
-            ErrorCode::CursorNotFound,
-            format!("Cursor {} not found", cursor_id),
-        ));
-    }
-
     let start_time = std::time::Instant::now();
-    // When maxTimeMS is not provided (try_next), return immediately (timeout=0)
-    // When maxTimeMS is provided (next), use that value for blocking
     let timeout_ms = max_time_ms.unwrap_or(0).max(0) as u128;
 
-    // Loop until we have events or timeout
     loop {
-        poll_wal_changes(connection_context, manager).await?;
+        let (namespace, current_lsn, start_at_operation_time) =
+            manager.get_cursor_info(cursor_id).await.ok_or_else(|| {
+                DocumentDBError::documentdb_error(
+                    ErrorCode::CursorNotFound,
+                    format!("Cursor {} not found", cursor_id),
+                )
+            })?;
 
-        let events = manager
-            .get_events(cursor_id, batch_size)
-            .await
-            .unwrap_or_default();
+        let (events, last_scanned_lsn) = fetch_wal_events(
+            connection_context,
+            &namespace,
+            current_lsn.as_deref(),
+            start_at_operation_time,
+            batch_size,
+        )
+        .await?;
+
+        let post_batch_resume_lsn =
+            last_scanned_lsn.unwrap_or_else(|| current_lsn.clone().unwrap_or_default());
 
         if !events.is_empty() {
+            let resume_lsn = events.last().unwrap().lsn.clone();
+            manager
+                .update_cursor_lsn(cursor_id, resume_lsn.clone())
+                .await;
+
             let mut next_batch = RawArrayBuf::new();
-            for e in events {
-                if let Some(event_doc) = build_change_event(e) {
-                    next_batch.push(event_doc);
+            for mut e in events {
+                e.cluster_time_increment = manager
+                    .get_next_cluster_time_increment(e.cluster_time)
+                    .await;
+                if let Some(doc) = build_change_event(e) {
+                    next_batch.push(doc);
                 }
             }
-
-            let local_time = get_current_time_millis()?;
-            return Ok(Response::Raw(RawResponse(rawdoc! {
-                "cursor": {
-                    "id": cursor_id,
-                    "nextBatch": next_batch
-                },
-                "ok": 1.0,
-                "operationTime": bson::Timestamp {
-                    time: (local_time / 1000) as u32,
-                    increment: (local_time % 1000) as u32
-                }
-            })));
+            return Ok(build_getmore_response(
+                cursor_id,
+                next_batch,
+                &post_batch_resume_lsn,
+            )?);
         }
 
-        // Check timeout
         if start_time.elapsed().as_millis() >= timeout_ms {
-            let local_time = get_current_time_millis()?;
-            return Ok(Response::Raw(RawResponse(rawdoc! {
-                "cursor": {
-                    "id": cursor_id,
-                    "nextBatch": RawArrayBuf::new()
-                },
-                "ok": 1.0,
-                "operationTime": bson::Timestamp {
-                    time: (local_time / 1000) as u32,
-                    increment: (local_time % 1000) as u32
-                }
-            })));
+            return Ok(build_getmore_response(
+                cursor_id,
+                RawArrayBuf::new(),
+                &post_batch_resume_lsn,
+            )?);
         }
 
-        // Sleep briefly before polling again to avoid hammering PostgreSQL
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 }
 
-/// Poll PostgreSQL WAL for new changes and deliver them to change stream cursors.
-///
-/// Queries the logical replication slot to get JSON-formatted change events from the decoder plugin.
-/// Each event includes operation type, namespace, LSN, timestamp, document key, and document content.
-/// Events are parsed, namespace-mapped from internal table names to db.collection format, and
-/// broadcast to all active change stream cursors.
-async fn poll_wal_changes(
+async fn fetch_wal_events(
     connection_context: &ConnectionContext,
-    manager: &ChangeStreamManager,
-) -> Result<()> {
-    use tokio_postgres::types::Type;
-
-    // Query WAL changes from replication slot (use get_changes to consume them)
-    let query = "SELECT data FROM pg_logical_slot_get_changes('documentdb_changestream', NULL, 1000, 'include-xids', '0')";
-
-    let service_context = &connection_context.service_context;
-    let pool = service_context
+    namespace: &str,
+    start_lsn: Option<&str>,
+    start_at_operation_time: Option<i64>,
+    batch_size: usize,
+) -> Result<(Vec<ChangeEvent>, Option<String>)> {
+    let pool = connection_context
+        .service_context
         .connection_pool_manager()
         .system_requests_connection()
         .await?;
+    let internal_ns = map_namespace_to_table(&pool, namespace).await?;
 
-    let empty_types: &[Type] = &[];
-    let empty_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[];
+    let query = match (start_lsn, start_at_operation_time) {
+        (Some(lsn), _) => format!(
+            "SELECT event_json, last_scanned_lsn FROM documentdb_api.decode_wal_direct('{}', {}, '{}', NULL)",
+            lsn, batch_size, internal_ns
+        ),
+        (None, Some(ts)) => format!(
+            "SELECT event_json, last_scanned_lsn FROM documentdb_api.decode_wal_direct(NULL, {}, '{}', {})",
+            batch_size, internal_ns, ts
+        ),
+        _ => return Ok((Vec::new(), None)),
+    };
+
     let rows = pool
-        .query(
-            query,
-            empty_types,
-            empty_params,
-            None,
-            &mut RequestTracker::new(),
-        )
+        .query(&query, &[], &[], None, &mut RequestTracker::new())
         .await?;
-
+    let mut events = Vec::new();
+    let mut last_scanned_lsn = None;
     for row in rows {
-        if let Ok(data) = row.try_get::<_, String>("data") {
-            parse_and_deliver_event(&data, &pool, manager).await;
+        if let Ok(data) = row.try_get::<_, String>(0) {
+            if let Some(event) = parse_wal_event(&data, &pool).await {
+                events.push(event);
+            }
+        }
+        if let Ok(lsn) = row.try_get::<_, String>(1) {
+            last_scanned_lsn = Some(lsn);
         }
     }
-
-    Ok(())
+    Ok((events, last_scanned_lsn))
 }
 
-/// Parse JSON event from decoder and deliver to change stream manager
-async fn parse_and_deliver_event(data: &str, pool: &Connection, manager: &ChangeStreamManager) {
-    let event_json = match serde_json::from_str::<serde_json::Value>(data) {
-        Ok(json) => json,
-        Err(_) => return,
-    };
-
-    let (op, ns, lsn, timestamp) = match (
-        event_json.get("op").and_then(|v| v.as_str()),
-        event_json.get("ns").and_then(|v| v.as_str()),
-        event_json.get("lsn").and_then(|v| v.as_str()),
-        event_json.get("timestamp").and_then(|v| v.as_i64()),
-    ) {
-        (Some(o), Some(n), Some(l), Some(t)) => (o, n, l, t),
-        _ => return,
-    };
-
+async fn parse_wal_event(data: &str, pool: &Connection) -> Option<ChangeEvent> {
+    let event_json = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    let op = event_json.get("op")?.as_str()?;
+    let ns = event_json.get("ns")?.as_str()?;
+    let lsn = event_json.get("lsn")?.as_str()?;
+    let timestamp = event_json.get("timestamp")?.as_i64()?;
     let actual_ns = map_table_to_namespace(pool, ns)
         .await
         .unwrap_or_else(|| ns.to_string());
-
     let document_key = event_json
-        .get("documentKey")
-        .and_then(|dk| dk.get("_id"))
-        .and_then(|id| id.as_str())
+        .get("tuple")
+        .and_then(|t| t.as_str())
         .map(|s| s.to_string());
 
-    let full_document = event_json
-        .get("fullDocument")
-        .and_then(|fd| fd.as_str())
-        .map(|s| s.to_string());
-
-    let old_document = event_json
-        .get("oldDocument")
-        .and_then(|od| od.as_str())
-        .map(|s| s.to_string());
-
-    let wall_time = timestamp / 1000;
-    let cluster_time = timestamp / 1000000;
-    let (_, increment) = manager.get_cluster_time_with_increment(cluster_time).await;
-
-    let event = ChangeEvent {
+    Some(ChangeEvent {
         op: op.to_string(),
         ns: actual_ns,
         lsn: lsn.to_string(),
-        document_key,
-        full_document,
-        old_document,
-        wall_time,
-        cluster_time,
-        cluster_time_increment: increment,
-    };
+        document_key: document_key.clone(),
+        full_document: document_key.clone(),
+        old_document: if op == "d" { document_key } else { None },
+        wall_time: timestamp / 1000,
+        cluster_time: timestamp / 1000000,
+        cluster_time_increment: 0,
+    })
+}
 
-    manager.deliver_event(event).await;
+async fn map_namespace_to_table(pool: &Connection, namespace: &str) -> Result<String> {
+    let parts: Vec<&str> = namespace.split('.').collect();
+    if parts.len() != 2 {
+        return Ok("documentdb_data.*".to_string());
+    }
+
+    let (db, coll) = (parts[0], parts[1]);
+    let rows = pool.query(
+        "SELECT collection_id FROM documentdb_api_catalog.collections WHERE database_name = $1 AND collection_name = $2",
+        &[tokio_postgres::types::Type::TEXT, tokio_postgres::types::Type::TEXT],
+        &[&db, &coll],
+        None,
+        &mut RequestTracker::new()
+    ).await?;
+
+    if let Some(row) = rows.first() {
+        if let Ok(collection_id) = row.try_get::<_, i64>(0) {
+            return Ok(format!("documentdb_data.documents_{}", collection_id));
+        }
+    }
+    Ok(format!("documentdb_data.nonexistent_{}_{}", db, coll))
+}
+
+async fn map_table_to_namespace(pool: &Connection, table_ns: &str) -> Option<String> {
+    let collection_id = table_ns
+        .strip_prefix("documentdb_data.documents_")?
+        .parse::<i32>()
+        .ok()?;
+    let rows = pool.query(
+        "SELECT database_name, collection_name FROM documentdb_api_catalog.collections WHERE collection_id = $1",
+        &[tokio_postgres::types::Type::INT4],
+        &[&collection_id],
+        None,
+        &mut RequestTracker::new()
+    ).await.ok()?;
+
+    rows.first().and_then(|row| {
+        let db = row.try_get::<_, String>(0).ok()?;
+        let coll = row.try_get::<_, String>(1).ok()?;
+        Some(format!("{}.{}", db, coll))
+    })
 }
 
 fn hex_to_bytes(hex: &str) -> std::result::Result<Vec<u8>, std::num::ParseIntError> {
@@ -222,26 +303,47 @@ fn hex_to_bytes(hex: &str) -> std::result::Result<Vec<u8>, std::num::ParseIntErr
         .collect()
 }
 
-/// Decode hex-encoded BSON and return RawDocumentBuf
 fn decode_hex_bson(hex: &str) -> Option<bson::RawDocumentBuf> {
-    hex_to_bytes(hex)
-        .ok()
-        .and_then(|bytes| bson::RawDocumentBuf::from_bytes(bytes).ok())
+    let bytes = hex_to_bytes(hex).ok()?;
+    for offset in 24..bytes.len().saturating_sub(4) {
+        let bson_len_bytes = bytes.get(offset..offset + 4)?;
+        let bson_len = u32::from_le_bytes([
+            bson_len_bytes[0],
+            bson_len_bytes[1],
+            bson_len_bytes[2],
+            bson_len_bytes[3],
+        ]) as usize;
+        if bson_len >= 10 && bson_len <= bytes.len() - offset {
+            if let Ok(doc) =
+                bson::RawDocumentBuf::from_bytes(bytes[offset..offset + bson_len].to_vec())
+            {
+                return Some(doc);
+            }
+        }
+    }
+    None
 }
 
-/// Extract ObjectId from document key hex (field name is empty string)
 fn extract_object_id(doc_key_hex: &str) -> Option<bson::oid::ObjectId> {
     decode_hex_bson(doc_key_hex)
-        .and_then(|doc| doc.get("").ok().flatten().and_then(|v| v.as_object_id()))
+        .and_then(|doc| doc.get("_id").ok().flatten().and_then(|v| v.as_object_id()))
 }
 
-/// Encode LSN as base64 resume token (opaque like MongoDB)
 fn encode_resume_token(lsn: &str) -> String {
     use base64::{engine::general_purpose::STANDARD, Engine};
     STANDARD.encode(lsn.as_bytes())
 }
 
-/// Build MongoDB change event document from ChangeEvent
+fn decode_resume_token(token: &str) -> Result<String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let bytes = STANDARD.decode(token).map_err(|_| {
+        DocumentDBError::documentdb_error(ErrorCode::BadValue, "Invalid resume token".to_string())
+    })?;
+    String::from_utf8(bytes).map_err(|_| {
+        DocumentDBError::documentdb_error(ErrorCode::BadValue, "Invalid resume token".to_string())
+    })
+}
+
 fn build_change_event(e: ChangeEvent) -> Option<bson::RawDocumentBuf> {
     let op_type = match e.op.as_str() {
         "i" => "insert",
@@ -250,194 +352,22 @@ fn build_change_event(e: ChangeEvent) -> Option<bson::RawDocumentBuf> {
         _ => return None,
     };
 
-    let db_name = e.ns.split('.').next().unwrap_or("");
-    let coll_name = e.ns.split('.').nth(1).unwrap_or("");
-    let wall_time_date = bson::DateTime::from_millis(e.wall_time);
-    let cluster_time_timestamp = bson::Timestamp {
-        time: e.cluster_time as u32,
-        increment: e.cluster_time_increment,
-    };
-    let oid = e
-        .document_key
-        .as_ref()
-        .and_then(|hex| extract_object_id(hex))?;
+    let mut parts = e.ns.split('.');
+    let (db_name, coll_name) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    let oid = extract_object_id(e.document_key.as_ref()?)?;
 
-    let resume_token = encode_resume_token(&e.lsn);
-
-    let base_doc = rawdoc! {
+    let mut doc = rawdoc! {
         "operationType": op_type,
         "ns": { "db": db_name, "coll": coll_name },
-        "_id": { "_data": resume_token },
-        "clusterTime": cluster_time_timestamp,
-        "wallTime": wall_time_date,
+        "_id": { "_data": encode_resume_token(&e.lsn) },
+        "clusterTime": bson::Timestamp { time: e.cluster_time as u32, increment: e.cluster_time_increment },
+        "wallTime": bson::DateTime::from_millis(e.wall_time),
         "documentKey": { "_id": oid }
     };
 
-    match op_type {
-        "insert" => append_to_base_insert(base_doc, &e),
-        "update" => append_to_base_update(base_doc, &e),
-        "delete" => append_to_base_delete(base_doc),
-        _ => None,
+    if op_type != "delete" {
+        let full_doc = decode_hex_bson(e.full_document.as_ref()?)?;
+        doc.append("fullDocument", full_doc);
     }
-}
-
-fn append_to_base_insert(
-    base_doc: bson::RawDocumentBuf,
-    e: &ChangeEvent,
-) -> Option<bson::RawDocumentBuf> {
-    let full_doc = decode_hex_bson(e.full_document.as_ref()?)?;
-    let mut doc = base_doc;
-    doc.append("fullDocument", full_doc);
     Some(doc)
-}
-
-fn append_to_base_update(
-    base_doc: bson::RawDocumentBuf,
-    e: &ChangeEvent,
-) -> Option<bson::RawDocumentBuf> {
-    let old_hex = e.old_document.as_ref()?;
-    let new_hex = e.full_document.as_ref()?;
-    let update_desc = compute_update_description(old_hex, new_hex)?;
-    let full_doc = decode_hex_bson(new_hex)?;
-
-    let mut doc = base_doc;
-    doc.append("fullDocument", full_doc);
-    doc.append("updateDescription", update_desc);
-    Some(doc)
-}
-
-fn append_to_base_delete(base_doc: bson::RawDocumentBuf) -> Option<bson::RawDocumentBuf> {
-    Some(base_doc)
-}
-
-fn is_array_truncation(old_value: bson::RawBsonRef, new_value: bson::RawBsonRef) -> bool {
-    let (Some(old_array), Some(new_array)) = (old_value.as_array(), new_value.as_array()) else {
-        return false;
-    };
-
-    let mut old_iter = old_array.into_iter();
-    let mut new_iter = new_array.into_iter();
-
-    // Check prefix equality
-    // Single traversal to make the new_iter exhaust
-    for new_elem in &mut new_iter {
-        let (Ok(new_e), Some(Ok(old_e))) = (new_elem, old_iter.next()) else {
-            return false;
-        };
-
-        if new_e.to_raw_bson() != old_e.to_raw_bson() {
-            return false;
-        }
-    }
-
-    // Truncation requires that old has more elements
-    old_iter.next().is_some()
-}
-
-/// Find updated and new fields by comparing old and new documents
-fn find_updated_and_new_fields(
-    old_doc: &bson::RawDocumentBuf,
-    new_doc: &bson::RawDocumentBuf,
-    updated_fields: &mut bson::RawDocumentBuf,
-    truncated_arrays: &mut bson::RawArrayBuf,
-) {
-    for result in new_doc.iter() {
-        if let Ok((key, new_value)) = result {
-            if key == "_id" {
-                continue;
-            }
-            match old_doc.get(key) {
-                // if the key exist in both
-                Ok(Some(old_value)) => {
-                    if is_array_truncation(old_value, new_value) {
-                        truncated_arrays.push(key);
-                        continue;
-                    }
-
-                    // Field exists in both - check if changed
-                    if old_value.to_raw_bson() != new_value.to_raw_bson() {
-                        updated_fields.append(key, new_value.to_raw_bson());
-                    }
-                }
-                // if the key exist only in new
-                _ => {
-                    // New field
-                    updated_fields.append(key, new_value.to_raw_bson());
-                }
-            }
-        }
-    }
-}
-
-/// Find removed fields by checking which fields exist in old but not in new
-fn find_removed_fields(
-    old_doc: &bson::RawDocumentBuf,
-    new_doc: &bson::RawDocumentBuf,
-    removed_fields: &mut bson::RawArrayBuf,
-) {
-    for result in old_doc.iter() {
-        if let Ok((key, _)) = result {
-            if key == "_id" {
-                continue;
-            }
-            if new_doc.get(key).ok().flatten().is_none() {
-                removed_fields.push(key);
-            }
-        }
-    }
-}
-
-/// Compute MongoDB updateDescription by comparing old and new documents.
-///
-/// Returns a document with updatedFields, removedFields, and truncatedArrays.
-/// Detects field changes, deletions, and array truncations (prefix-preserving size reductions).
-fn compute_update_description(
-    old_doc_hex: &str,
-    new_doc_hex: &str,
-) -> Option<bson::RawDocumentBuf> {
-    let old_doc = decode_hex_bson(old_doc_hex)?;
-    let new_doc = decode_hex_bson(new_doc_hex)?;
-
-    let mut updated_fields = bson::RawDocumentBuf::new();
-    let mut removed_fields = bson::RawArrayBuf::new();
-    let mut truncated_arrays = bson::RawArrayBuf::new();
-
-    find_updated_and_new_fields(
-        &old_doc,
-        &new_doc,
-        &mut updated_fields,
-        &mut truncated_arrays,
-    );
-    find_removed_fields(&old_doc, &new_doc, &mut removed_fields);
-
-    Some(rawdoc! {
-        "updatedFields": updated_fields,
-        "removedFields": removed_fields,
-        "truncatedArrays": truncated_arrays
-    })
-}
-
-async fn map_table_to_namespace(pool: &Connection, table_ns: &str) -> Option<String> {
-    // Extract collection_id from documentdb_data.documents_X
-    if let Some(table_name) = table_ns.strip_prefix("documentdb_data.documents_") {
-        if let Ok(collection_id) = table_name.parse::<i32>() {
-            let query = "SELECT database_name, collection_name FROM documentdb_api_catalog.collections WHERE collection_id = $1";
-            let types = &[tokio_postgres::types::Type::INT4];
-            let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&collection_id];
-
-            if let Ok(rows) = pool
-                .query(query, types, params, None, &mut RequestTracker::new())
-                .await
-            {
-                if let Some(row) = rows.first() {
-                    if let (Ok(db), Ok(coll)) =
-                        (row.try_get::<_, String>(0), row.try_get::<_, String>(1))
-                    {
-                        return Some(format!("{}.{}", db, coll));
-                    }
-                }
-            }
-        }
-    }
-    None
 }

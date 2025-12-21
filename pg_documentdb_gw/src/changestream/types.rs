@@ -1,22 +1,9 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
-// Multiple readers can hold lock simultaneously while only one writer can hold lock (blocks all readers/writers)
 use tokio::sync::RwLock;
 
 pub type CursorId = i64;
 
-// Note: Add Serialize/Deserialize derives when integrating with Kafka or other stuff in the future
-///
-///    An example of ChangeEvent
-///    {
-///        operationType: 'insert',
-///        ns: { db: 'mydb', coll: 'test' },
-///        _id: { _data: '0/253F420' },
-///        clusterTime: Timestamp({ t: 1765753609, i: 1 }),
-///        wallTime: ISODate('2025-12-14T23:06:49.582Z'),
-///        documentKey: { _id: ObjectId('693f4309f13e24d00289b03e') },
-///        fullDocument: { _id: ObjectId('693f4309f13e24d00289b03e'), x: 1 }
-///    }
 #[derive(Debug, Clone)]
 pub struct ChangeEvent {
     pub op: String,
@@ -46,86 +33,57 @@ impl ChangeStreamManager {
         }
     }
 
-    /// Creates a new change stream cursor for the given namespace.
-    ///
-    /// Returns the cursor ID that can be used to retrieve events.
-    pub async fn create_cursor(&self, namespace: String) -> CursorId {
+    pub async fn create_cursor(&self, namespace: String, start_lsn: Option<String>, start_at_operation_time: Option<i64>) -> CursorId {
         let mut next_id = self.next_cursor_id.write().await;
         let cursor_id = *next_id;
         *next_id += 1;
 
         let cursor = Cursor {
             namespace,
-            buffer: VecDeque::new(),
-            max_buffer_size: 10000, // Limit to 10K events (~30MB per cursor)
+            current_lsn: start_lsn,
+            start_at_operation_time,
         };
 
         self.cursors.write().await.insert(cursor_id, cursor);
         cursor_id
     }
 
-    /// Checks if a cursor with the given ID exists.
     pub async fn has_cursor(&self, cursor_id: CursorId) -> bool {
         self.cursors.read().await.contains_key(&cursor_id)
     }
 
-    /// Retrieves up to batch_size events from the cursor's buffer.
-    ///
-    /// Returns None if the cursor doesn't exist, or Some(Vec) with available events.
-    pub async fn get_events(
-        &self,
-        cursor_id: CursorId,
-        batch_size: usize,
-    ) -> Option<Vec<ChangeEvent>> {
-        let mut cursors = self.cursors.write().await;
-        let cursor = cursors.get_mut(&cursor_id)?;
-
-        let mut events = Vec::new();
-        for _ in 0..batch_size {
-            if let Some(event) = cursor.buffer.pop_front() {
-                events.push(event);
-            } else {
-                break;
-            }
-        }
-        Some(events)
+    pub async fn get_cursor_info(&self, cursor_id: CursorId) -> Option<(String, Option<String>, Option<i64>)> {
+        let cursors = self.cursors.read().await;
+        cursors
+            .get(&cursor_id)
+            .map(|c| (c.namespace.clone(), c.current_lsn.clone(), c.start_at_operation_time))
     }
 
-    /// Delivers a change event to all cursors watching the event's namespace.
-    /// If a cursor's buffer is full, the oldest event is dropped (FIFO eviction).
-    pub async fn deliver_event(&self, event: ChangeEvent) {
+    pub async fn update_cursor_lsn(&self, cursor_id: CursorId, new_lsn: String) {
         let mut cursors = self.cursors.write().await;
-        for cursor in cursors.values_mut() {
-            if cursor.namespace == event.ns {
-                // If buffer is full, drop oldest event
-                if cursor.buffer.len() >= cursor.max_buffer_size {
-                    cursor.buffer.pop_front();
-                }
-                cursor.buffer.push_back(event.clone());
-            }
+        if let Some(cursor) = cursors.get_mut(&cursor_id) {
+            cursor.current_lsn = Some(new_lsn);
         }
     }
 
-    // Get next cluster time with proper increment (MongoDB-style)
-    pub async fn get_cluster_time_with_increment(&self, timestamp_seconds: i64) -> (u32, u32) {
-        let mut last_time = self.last_cluster_time.write().await;
-        let (last_seconds, last_increment) = *last_time;
+    pub async fn delete_cursor(&self, cursor_id: CursorId) {
+        self.cursors.write().await.remove(&cursor_id);
+    }
 
-        if timestamp_seconds == last_seconds {
-            // Same second, increment the counter
-            let new_increment = last_increment + 1;
-            *last_time = (timestamp_seconds, new_increment);
-            (timestamp_seconds as u32, new_increment)
+    pub async fn get_next_cluster_time_increment(&self, cluster_time_seconds: i64) -> u32 {
+        let mut last = self.last_cluster_time.write().await;
+        if last.0 == cluster_time_seconds {
+            last.1 += 1;
+            last.1
         } else {
-            // New second, reset increment to 1
-            *last_time = (timestamp_seconds, 1);
-            (timestamp_seconds as u32, 1)
+            *last = (cluster_time_seconds, 1);
+            1
         }
     }
 }
 
 struct Cursor {
     namespace: String,
-    buffer: VecDeque<ChangeEvent>,
-    max_buffer_size: usize, // Maximum events to buffer
+    current_lsn: Option<String>,
+    start_at_operation_time: Option<i64>,
 }

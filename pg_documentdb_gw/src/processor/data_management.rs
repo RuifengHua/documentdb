@@ -76,11 +76,14 @@ pub async fn process_aggregate(
     if is_changestream_request(request_context)? {
         let db = request_context.info.db()?;
         let collection = request_context.info.collection().unwrap_or("");
+        let (resume_token, start_at_operation_time) = extract_changestream_params(request_context)?;
         return crate::changestream::process_changestream(
             request_context,
             connection_context,
             db,
             collection,
+            resume_token,
+            start_at_operation_time,
         )
         .await;
     }
@@ -202,6 +205,42 @@ fn is_changestream_request(request_context: &RequestContext<'_>) -> Result<bool>
 
     // return true if the key is "$changeStream"
     Ok(stage_key == "$changeStream")
+}
+
+fn extract_changestream_params(request_context: &RequestContext<'_>) -> Result<(Option<String>, Option<i64>)> {
+    let pipeline = request_context.payload.document().get("pipeline")?
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| DocumentDBError::documentdb_error(ErrorCode::BadValue, "Missing pipeline".to_string()))?;
+    
+    let first_stage = pipeline.into_iter().next()
+        .ok_or_else(|| DocumentDBError::documentdb_error(ErrorCode::BadValue, "Empty pipeline".to_string()))?
+        .ok()
+        .ok_or_else(|| DocumentDBError::documentdb_error(ErrorCode::BadValue, "Invalid stage result".to_string()))?
+        .as_document()
+        .ok_or_else(|| DocumentDBError::documentdb_error(ErrorCode::BadValue, "Invalid stage".to_string()))?;
+    
+    let changestream_doc = first_stage.get("$changeStream")?
+        .and_then(|d| d.as_document())
+        .ok_or_else(|| DocumentDBError::documentdb_error(ErrorCode::BadValue, "Missing $changeStream".to_string()))?;
+    
+    let resume_token = changestream_doc.get("resumeAfter")?
+        .and_then(|r| r.as_document())
+        .and_then(|d| d.get("_data").ok().flatten())
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    
+    let start_at_operation_time = changestream_doc.get("startAtOperationTime")?
+        .and_then(|t| t.as_timestamp())
+        .map(|ts| ts.time as i64);
+    
+    if resume_token.is_some() && start_at_operation_time.is_some() {
+        return Err(DocumentDBError::documentdb_error(
+            ErrorCode::BadValue,
+            "Cannot specify both resumeAfter and startAtOperationTime".to_string(),
+        ));
+    }
+    
+    Ok((resume_token, start_at_operation_time))
 }
 
 fn convert_to_scale(scale: RawBsonRef) -> Result<f64> {
